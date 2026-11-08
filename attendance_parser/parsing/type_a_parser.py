@@ -60,7 +60,17 @@ class TypeAParser(BaseParser):
 
         shabbat, p150, p125, p100, total, break_val, exit_val, entry_val = data_parts[:8]
         trailing_fields = data_parts[8:]
-        location_val = trailing_fields[-2] if len(trailing_fields) >= 2 else ""
+        reported_day = trailing_fields[-1] if trailing_fields else ""
+        is_reported_day = (
+            any(weekday in reported_day for weekday in _WEEKDAY_NAMES)
+            or any(marker in reported_day.lower() for marker in _HOLIDAY_MARKERS)
+        )
+        location_index = -2 if len(trailing_fields) >= 2 else -1
+        location_val = (
+            trailing_fields[location_index]
+            if trailing_fields and (len(trailing_fields) >= 2 or not is_reported_day)
+            else ""
+        )
         if not any("\u0590" <= character <= "\u05ff" for character in location_val):
             location_val = ""
 
@@ -78,7 +88,6 @@ class TypeAParser(BaseParser):
         )
         total_val = parse_number(total)
         shabbat_val = parse_number(shabbat)
-        reported_day = trailing_fields[-1] if trailing_fields else ""
         if any(marker in reported_day.lower() for marker in _HOLIDAY_MARKERS):
             day_val = reported_day
         special_day = is_sabbath_or_holiday(day_val, date_val)

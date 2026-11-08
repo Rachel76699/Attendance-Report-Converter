@@ -23,6 +23,10 @@ def rtl(text: str) -> str:
     return " ".join(processed_tokens[::-1])
 
 
+def _display_type_a_hour(value: str | None) -> str:
+    return value if value else "---"
+
+
 def generate_pdf(report: AttendanceReport, output_path: str) -> str:
     # הגדרת תבנית המסמך והשוליים עבור קובץ ה-PDF
     doc = SimpleDocTemplate(
@@ -104,8 +108,8 @@ def generate_pdf(report: AttendanceReport, output_path: str) -> str:
             table_data.append([
                 Paragraph(rtl(r.location), type_b_cell_style),
                 Paragraph(str(r.total), type_b_cell_style),
-                Paragraph(format_clock_minutes(r.exit), type_b_cell_style),
-                Paragraph(format_clock_minutes(r.entry), type_b_cell_style),
+                Paragraph(format_clock_minutes(r.exit) or "---", type_b_cell_style),
+                Paragraph(format_clock_minutes(r.entry) or "---", type_b_cell_style),
                 Paragraph(rtl(r.day), type_b_cell_style),
                 Paragraph(str(r.date), type_b_cell_style)
             ])
@@ -142,12 +146,12 @@ def generate_pdf(report: AttendanceReport, output_path: str) -> str:
                 Paragraph(f"{(r.p125 or 0.0):.2f}", hebrew_style),
                 Paragraph(f"{(r.p100 or 0.0):.2f}", hebrew_style),
                 Paragraph(str(r.total), hebrew_style),
-                Paragraph(format_duration_minutes(r.break_time), hebrew_style),
-                Paragraph(format_clock_minutes(r.exit), hebrew_style),
-                Paragraph(format_clock_minutes(r.entry), hebrew_style),
+                Paragraph(_display_type_a_hour(format_duration_minutes(r.break_time)), hebrew_style),
+                Paragraph(_display_type_a_hour(format_clock_minutes(r.exit)), hebrew_style),
+                Paragraph(_display_type_a_hour(format_clock_minutes(r.entry)), hebrew_style),
                 Paragraph(rtl(r.location), hebrew_style),
                 Paragraph(rtl(r.day), hebrew_style),
-                Paragraph(str(r.date), hebrew_style)
+                Paragraph(r.date, hebrew_style)
             ])
 
         t = Table(table_data, colWidths=[45, 45, 45, 45, 45, 45, 45, 45, 55, 55, 65])

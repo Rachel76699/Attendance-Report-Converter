@@ -16,9 +16,17 @@ TEXT_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "text_cache"
 OCR_DPI = 300
 
 
+def _ocr_language_signature() -> str:
+    return ",".join(
+        sorted(language.language_tag for language in OcrEngine.available_recognizer_languages)
+    )
+
+
 def _cache_path_for_pdf(pdf_path: str) -> Path:
     digest = hashlib.sha256()
-    digest.update(f"ocr-dpi:{OCR_DPI}\0".encode("ascii"))
+    digest.update(
+        f"ocr-dpi:{OCR_DPI}\0ocr-languages:{_ocr_language_signature()}\0".encode("utf-8")
+    )
     with open(pdf_path, "rb") as pdf_file:
         for chunk in iter(lambda: pdf_file.read(1024 * 1024), b""):
             digest.update(chunk)
@@ -58,7 +66,17 @@ def _extract_text_without_cache(pdf_path: str) -> str:
                 page_text = page.get_text("text").strip()
                 if not page_text:
                     if ocr_engine is None:
-                        ocr_engine = OcrEngine.try_create_from_language(Language("he-IL"))
+                        hebrew_language = Language("he-IL")
+                        hebrew_supported = OcrEngine.is_language_supported(hebrew_language)
+                        ocr_engine = OcrEngine.try_create_from_language(hebrew_language)
+                        if not hebrew_supported:
+                            print(
+                                "[Warning] Hebrew OCR language (he-IL) is not installed. "
+                                "Hebrew fields such as location may not be recognized; "
+                                "install the Hebrew language pack and process the PDF again."
+                            )
+                        elif not ocr_engine:
+                            print("[Warning] Could not initialize the Hebrew OCR engine.")
                         if not ocr_engine:
                             ocr_engine = OcrEngine.try_create_from_user_profile_languages()
                         if not ocr_engine:

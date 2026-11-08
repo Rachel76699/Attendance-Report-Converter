@@ -74,11 +74,44 @@ class TransformationService:
         self.seed = seed
         self.rng = random.Random(seed)
 
-    def _perturb_time(self, time_minutes: int | None) -> int | None:
-        """Adjusts a valid entry time by a bounded random number of minutes."""
+    def _perturb_workday_times(
+        self,
+        entry: int | None,
+        exit: int | None,
+    ) -> tuple[int | None, int | None]:
+        """Shift available workday times independently while keeping valid ordering."""
+        if entry is None and exit is None:
+            return entry, exit
+
+        offsets = tuple(range(ENTRY_SHIFT_MINUTES[0], 0)) + tuple(
+            range(1, ENTRY_SHIFT_MINUTES[1] + 1)
+        )
+        if entry is None or exit is None:
+            offset_minutes = self.rng.choice(offsets)
+            return self._shift_time(entry, offset_minutes), self._shift_time(exit, offset_minutes)
+
+        original_duration = (exit - entry) % (24 * 60)
+        if original_duration == 0:
+            return entry, exit
+
+        valid_offsets = [
+            (entry_offset, exit_offset)
+            for entry_offset in offsets
+            for exit_offset in offsets
+            if entry_offset != exit_offset
+            and 0 < original_duration + exit_offset - entry_offset < 24 * 60
+        ]
+        entry_offset, exit_offset = self.rng.choice(valid_offsets)
+        return (
+            self._shift_time(entry, entry_offset),
+            self._shift_time(exit, exit_offset),
+        )
+
+    @staticmethod
+    def _shift_time(time_minutes: int | None, offset_minutes: int) -> int | None:
+        """Shift a valid clock time without changing missing values."""
         if time_minutes is None:
             return None
-        offset_minutes = self.rng.randint(*ENTRY_SHIFT_MINUTES)
         return (time_minutes + offset_minutes) % (24 * 60)
 
     def transform(self, report: AttendanceReport) -> AttendanceReport:
@@ -87,25 +120,37 @@ class TransformationService:
         """
 
         transformed_rows = []
+        has_recalculated_hours = False
 
         # מעבר על כל שורת נוכחות בדוח ועדכון שעות הכניסה והיציאה
         for row in report.rows:
             special_day = row.special_day or is_sabbath_or_holiday(row.day, row.date)
             if special_day:
                 new_entry = None
+                new_exit = None
             elif is_work_day(row.day, row.date):
-                new_entry = self._perturb_time(row.entry)
+                new_entry, new_exit = self._perturb_workday_times(row.entry, row.exit)
             else:
                 new_entry = row.entry
+                new_exit = row.exit
+
+            new_break_time = None if special_day else row.break_time
+            new_total = row.total
+            if not special_day and new_entry is not None and new_exit is not None:
+                if new_entry != row.entry or new_exit != row.exit:
+                    worked_minutes = (new_exit - new_entry) % (24 * 60)
+                    break_minutes = new_break_time or 0
+                    new_total = round(max(0, worked_minutes - break_minutes) / 60, 2)
+                    has_recalculated_hours = True
 
             transformed_rows.append(
                 AttendanceRow(
                     date=row.date,
                     day=special_day_label(row.day, special_day),
                     entry=new_entry,
-                    exit=None if special_day else row.exit,
-                    total=row.total,
-                    break_time=None if special_day else row.break_time,
+                    exit=new_exit,
+                    total=new_total,
+                    break_time=new_break_time,
                     location=row.location,
                     shabbat=row.shabbat,
                     p150=row.p150,
@@ -115,16 +160,13 @@ class TransformationService:
                 )
             )
 
-        if report.report_type == ReportType.TYPE_B:
-            summary = report.summary
-        else:
-            summary = build_summary(
-                transformed_rows,
-                report_type=report.report_type,
-                fallback_days=report.summary.total_days,
-                fallback_hours=report.summary.total_hours,
-                hourly_rate=report.summary.hourly_rate
-            )
+        summary = build_summary(
+            transformed_rows,
+            report_type=report.report_type,
+            fallback_days=report.summary.total_days,
+            fallback_hours=0.0 if has_recalculated_hours else report.summary.total_hours,
+            hourly_rate=report.summary.hourly_rate
+        )
 
         # החזרת אובייקט דוח חדש המכיל את השורות והסיכום המעודכנים
         return AttendanceReport(

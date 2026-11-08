@@ -6,6 +6,10 @@ from domain.models import AttendanceReport, ReportType
 from domain.time_utils import format_clock_minutes, format_duration_minutes
 
 
+def _display_type_a_hour(value: str) -> str:
+    return value if value else "---"
+
+
 class ExcelRenderer:
     def render(self, report: AttendanceReport, output_path: str) -> str:
         workbook = Workbook()
@@ -19,17 +23,23 @@ class ExcelRenderer:
                 "יציאה", "כניסה", "מקום", "יום", "תאריך"
             ]
             row_values = lambda row: [
-                row.shabbat, row.p150, row.p125, row.p100, row.total,
-                format_duration_minutes(row.break_time),
-                format_clock_minutes(row.exit),
-                format_clock_minutes(row.entry),
-                row.location, row.day, row.date
+                row.shabbat,
+                row.p150,
+                row.p125,
+                row.p100,
+                row.total,
+                _display_type_a_hour(format_duration_minutes(row.break_time)),
+                _display_type_a_hour(format_clock_minutes(row.exit)),
+                _display_type_a_hour(format_clock_minutes(row.entry)),
+                row.location,
+                row.day,
+                row.date
             ]
         else:
             headers = ["הערות", "סה״כ שעות", "שעת יציאה", "שעת כניסה", "יום בשבוע", "תאריך"]
             row_values = lambda row: [
-                row.location, row.total, format_clock_minutes(row.exit),
-                format_clock_minutes(row.entry), row.day, row.date
+                row.location, row.total, format_clock_minutes(row.exit) or "---",
+                format_clock_minutes(row.entry) or "---", row.day, row.date
             ]
 
         worksheet.append(headers)

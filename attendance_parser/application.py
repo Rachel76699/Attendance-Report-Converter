@@ -2,6 +2,7 @@ import argparse
 import os
 import traceback
 
+from domain.models import AttendanceReport
 from generation import excel_renderer, pdf_generator
 from parsing import classifier, ocr, parser_factory
 from transformation import strategies
@@ -45,11 +46,54 @@ def collect_pdf_files(source: str) -> list[str]:
     return []
 
 
+def _available_output_paths(output_dir: str, stem: str) -> tuple[str, str]:
+    suffix = 1
+    while True:
+        candidate_stem = f"{stem}_{suffix}"
+        pdf_path = os.path.join(output_dir, f"{candidate_stem}.pdf")
+        excel_path = os.path.join(output_dir, f"{candidate_stem}.xlsx")
+        if not os.path.exists(pdf_path) and not os.path.exists(excel_path):
+            return pdf_path, excel_path
+        suffix += 1
+
+
+def _generate_outputs(
+    report: AttendanceReport,
+    pdf_path: str,
+    excel_path: str,
+    output_dir: str,
+    stem: str,
+) -> tuple[str, str]:
+    try:
+        pdf_generator.generate_pdf(report, pdf_path)
+        excel_renderer.ExcelRenderer().render(report, excel_path)
+        return pdf_path, excel_path
+    except PermissionError as error:
+        blocked_path = getattr(error, "filename", None)
+        output_paths = {
+            os.path.normcase(os.path.abspath(pdf_path)),
+            os.path.normcase(os.path.abspath(excel_path)),
+        }
+        if not blocked_path or os.path.normcase(os.path.abspath(blocked_path)) not in output_paths:
+            raise
+
+        fallback_pdf_path, fallback_excel_path = _available_output_paths(output_dir, stem)
+        print(
+            "    [Warning] An existing output file is unavailable "
+            f"(possibly open in another program). Saving as: "
+            f"{os.path.basename(fallback_pdf_path)} and {os.path.basename(fallback_excel_path)}"
+        )
+        pdf_generator.generate_pdf(report, fallback_pdf_path)
+        excel_renderer.ExcelRenderer().render(report, fallback_excel_path)
+        return fallback_pdf_path, fallback_excel_path
+
+
 def process_single_pdf(input_path: str, output_dir: str) -> bool:
     filename = os.path.basename(input_path)
     stem = os.path.splitext(filename)[0]
-    pdf_path = os.path.join(output_dir, f"NEW_{stem}.pdf")
-    excel_path = os.path.join(output_dir, f"NEW_{stem}.xlsx")
+    output_stem = f"NEW_{stem}"
+    pdf_path = os.path.join(output_dir, f"{output_stem}.pdf")
+    excel_path = os.path.join(output_dir, f"{output_stem}.xlsx")
     print(f"\n[+] Processing: {filename}")
     try:
         raw_text = ocr.extract_text_from_pdf(input_path)
@@ -60,9 +104,10 @@ def process_single_pdf(input_path: str, output_dir: str) -> bool:
         report = parser_factory.get_parser(report_type).parse(raw_text)
         report = strategies.TransformationService(seed=42).transform(report)
         os.makedirs(output_dir, exist_ok=True)
-        pdf_generator.generate_pdf(report, pdf_path)
-        excel_renderer.ExcelRenderer().render(report, excel_path)
-        print(f"    [Success] Saved to: {pdf_path} and {excel_path}")
+        saved_pdf_path, saved_excel_path = _generate_outputs(
+            report, pdf_path, excel_path, output_dir, output_stem
+        )
+        print(f"    [Success] Saved to: {saved_pdf_path} and {saved_excel_path}")
         return True
     except Exception as error:
         print(f"    [Error] Failed to process {filename}: {error}")

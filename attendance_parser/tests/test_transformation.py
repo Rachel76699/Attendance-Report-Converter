@@ -7,6 +7,7 @@ from unittest.mock import patch
 from openpyxl import load_workbook
 import pymupdf
 import pytest
+from application import process_single_pdf
 from domain.models import AttendanceReport, AttendanceRow, ReportSummary, ReportType
 from parsing import ocr
 from parsing.classifier import classify_report_type
@@ -108,6 +109,24 @@ class TestAttendanceSystem(unittest.TestCase):
                 ) as uncached_extraction:
                     self.assertEqual(ocr.extract_text_from_pdf(pdf_path), extracted)
                     uncached_extraction.assert_not_called()
+
+    def test_pdf_text_cache_is_invalidated_when_ocr_languages_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = os.path.join(directory, "report.pdf")
+            cache_dir = Path(directory) / "text_cache"
+            document = pymupdf.open()
+            document.new_page().insert_text((72, 72), "Digital report")
+            document.save(pdf_path)
+            document.close()
+
+            with (
+                patch.object(ocr, "TEXT_CACHE_DIR", cache_dir),
+                patch.object(ocr, "_ocr_language_signature", side_effect=["en-US", "en-US,he-IL"]),
+                patch.object(ocr, "_extract_text_without_cache", return_value="Fresh OCR text") as extract,
+            ):
+                self.assertEqual(ocr.extract_text_from_pdf(pdf_path), "Fresh OCR text")
+                self.assertEqual(ocr.extract_text_from_pdf(pdf_path), "Fresh OCR text")
+                self.assertEqual(extract.call_count, 2)
 
     def test_ocr_table_rows_are_reassembled_by_position(self):
         words = [
@@ -239,7 +258,10 @@ class TestAttendanceSystem(unittest.TestCase):
         self.assertEqual(report.summary.total_days, 3)
         self.assertEqual(report.summary.total_payment, 321.83)
         transformed = TransformationService(seed=42).transform(report)
-        self.assertEqual(transformed.summary, report.summary)
+        self.assertEqual(
+            transformed.summary.total_hours,
+            round(sum(row.total for row in transformed.rows if row.total > 0), 2)
+        )
 
     def test_type_b_parser_does_not_count_ocr_noise_as_saturday_hours(self):
         report = TypeBParser().parse(
@@ -273,10 +295,15 @@ class TestAttendanceSystem(unittest.TestCase):
             workbook = load_workbook(path)
             worksheet = workbook["נוכחות"]
             self.assertEqual(worksheet["B2"].value, 3.5)
-            self.assertIsNone(worksheet["C2"].value)
-            self.assertIsNone(worksheet["D2"].value)
+            self.assertEqual(worksheet["C2"].value, "---")
+            self.assertEqual(worksheet["D2"].value, "---")
             self.assertEqual(worksheet["E2"].value, "יום כיפור")
             workbook.close()
+
+            pdf_path = os.path.join(directory, "holiday.pdf")
+            generate_pdf(report, pdf_path)
+            with pymupdf.open(pdf_path) as document:
+                self.assertIn("---", document[0].get_text())
 
     def test_type_a_saturday_row_is_kept_without_clock_times(self):
         raw = (
@@ -300,11 +327,46 @@ class TestAttendanceSystem(unittest.TestCase):
             workbook = load_workbook(path)
             worksheet = workbook["נוכחות"]
             self.assertEqual(worksheet["E2"].value, 6.5)
-            self.assertIsNone(worksheet["F2"].value)
-            self.assertIsNone(worksheet["G2"].value)
-            self.assertIsNone(worksheet["H2"].value)
+            self.assertEqual(worksheet["F2"].value, "---")
+            self.assertEqual(worksheet["G2"].value, "---")
+            self.assertEqual(worksheet["H2"].value, "---")
+            self.assertIsNone(worksheet["I2"].value)
             self.assertEqual(worksheet["J2"].value, "שבת")
+            self.assertEqual(worksheet["K2"].value, "08/10/2022")
             workbook.close()
+
+            pdf_path = os.path.join(directory, "saturday.pdf")
+            generate_pdf(report, pdf_path)
+            with pymupdf.open(pdf_path) as document:
+                self.assertIn("---", document[0].get_text())
+
+    def test_type_a_location_is_preserved_and_not_replaced_with_placeholder(self):
+        raw = (
+            "0 | 0 | 0 | 6.50 | 6.50 | 00:30 | 15:00 | 08:00 | "
+            "משרד | יום ראשון | 02/10/2022"
+        )
+        report = TypeAParser().parse(raw)
+
+        self.assertEqual(report.rows[0].location, "משרד")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "location.xlsx")
+            ExcelRenderer().render(report, path)
+            workbook = load_workbook(path)
+            worksheet = workbook["נוכחות"]
+            self.assertEqual(worksheet["I2"].value, "משרד")
+            self.assertEqual(worksheet["J2"].value, "יום ראשון")
+            self.assertEqual(worksheet["K2"].value, "02/10/2022")
+            workbook.close()
+
+    def test_type_a_parser_preserves_location_when_weekday_is_missing(self):
+        raw = (
+            "0 | 0 | 0 | 6.50 | 6.50 | 00:30 | 15:00 | 08:00 | "
+            "גליליון | 02/10/2022"
+        )
+        row = TypeAParser().parse(raw).rows[0]
+
+        self.assertEqual(row.location, "גליליון")
+        self.assertEqual(row.day, "יום ראשון")
 
     def test_parser_handles_invalid_clock_values(self):
         raw = "0 | 0 | 0 | 6.50 | 6.50 | 00:60 | 25:61 | 08:30 | office | Sunday | 02/10/2022"
@@ -333,13 +395,22 @@ class TestAttendanceSystem(unittest.TestCase):
 
         t_row = transformed_report.rows[0]
 
-        # מוודא שזמני הכניסה והיציאה עברו שינוי (היסט אקראי) ושאינם שווים בדיוק למקור העגול
+        # שתי השעות מוזזות בנפרד, והכניסה נשארת לפני היציאה.
         self.assertIsNotNone(t_row.entry)
         self.assertNotEqual(t_row.entry, 8 * 60)
-        self.assertEqual(t_row.exit, 15 * 60)
         entry_shift = t_row.entry - (8 * 60)
+        exit_shift = t_row.exit - (15 * 60)
         self.assertGreaterEqual(entry_shift, -5)
         self.assertLessEqual(entry_shift, 10)
+        self.assertNotEqual(t_row.exit, 15 * 60)
+        self.assertGreaterEqual(exit_shift, -5)
+        self.assertLessEqual(exit_shift, 10)
+        self.assertNotEqual(exit_shift, entry_shift)
+        self.assertGreater(t_row.exit, t_row.entry)
+        self.assertEqual(
+            t_row.total,
+            round((t_row.exit - t_row.entry - row.break_time) / 60, 2)
+        )
 
         # מוודא שהתשלום מחושב מחדש בהתאם לסך השעות שבשורות
         self.assertEqual(
@@ -359,6 +430,34 @@ class TestAttendanceSystem(unittest.TestCase):
         row = TypeAParser().parse(raw).rows[0]
 
         self.assertEqual((row.shabbat, row.p150, row.p125, row.p100), (1.0, 2.0, 1.5, 6.5))
+
+    def test_transformation_shifts_type_b_times_independently_and_recalculates_hours(self):
+        row = AttendanceRow(
+            date="02/10/2022",
+            day="יום ראשון",
+            entry=8 * 60 + 30,
+            exit=12 * 60,
+            total=3.5,
+        )
+        summary = ReportSummary(1, 3.5, 30.65, 107.28)
+        report = AttendanceReport(ReportType.TYPE_B, (row,), summary)
+
+        transformed = TransformationService(seed=42).transform(report)
+        transformed_row = transformed.rows[0]
+
+        self.assertNotEqual(transformed_row.entry, row.entry)
+        self.assertNotEqual(transformed_row.exit, row.exit)
+        self.assertNotEqual(
+            transformed_row.entry - row.entry,
+            transformed_row.exit - row.exit,
+        )
+        self.assertGreater(transformed_row.exit, transformed_row.entry)
+        self.assertEqual(
+            transformed_row.total,
+            round((transformed_row.exit - transformed_row.entry) / 60, 2),
+        )
+        self.assertEqual(transformed.summary.total_hours, transformed_row.total)
+        self.assertNotEqual(transformed.summary.total_hours, summary.total_hours)
 
     def test_saturday_times_are_not_changed(self):
         row = AttendanceRow(
@@ -466,6 +565,38 @@ class TestAttendanceSystem(unittest.TestCase):
                 self.assertEqual(len(document), 1)
                 self.assertIn("2574.60", document[0].get_text())
 
+    def test_locked_output_uses_an_available_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_paths = []
+
+            def write_pdf(report, path):
+                output_paths.append(path)
+                if os.path.basename(path) == "NEW_report.pdf":
+                    raise PermissionError(13, "Permission denied", path)
+                Path(path).write_bytes(b"pdf")
+                return path
+
+            class TestExcelRenderer:
+                def render(self, report, path):
+                    output_paths.append(path)
+                    Path(path).write_bytes(b"xlsx")
+                    return path
+
+            with (
+                patch("application.ocr.extract_text_from_pdf", return_value=self.raw_text_type_a),
+                patch("application.classifier.classify_report_type", return_value=ReportType.TYPE_A),
+                patch("application.pdf_generator.generate_pdf", side_effect=write_pdf),
+                patch("application.excel_renderer.ExcelRenderer", TestExcelRenderer),
+            ):
+                self.assertTrue(process_single_pdf("report.pdf", directory))
+
+            self.assertEqual(
+                [os.path.basename(path) for path in output_paths],
+                ["NEW_report.pdf", "NEW_report_1.pdf", "NEW_report_1.xlsx"]
+            )
+            self.assertTrue(os.path.isfile(os.path.join(directory, "NEW_report_1.pdf")))
+            self.assertTrue(os.path.isfile(os.path.join(directory, "NEW_report_1.xlsx")))
+
     def test_transformation_recalculates_stale_summary(self):
         row = AttendanceRow(
             date="02/10/2022",
@@ -488,8 +619,16 @@ class TestAttendanceSystem(unittest.TestCase):
 
         transformed_report = TransformationService(seed=42).transform(report)
 
-        self.assertEqual(transformed_report.summary.total_hours, 7.25)
-        self.assertEqual(transformed_report.summary.total_payment, 222.21)
+        transformed_row = transformed_report.rows[0]
+        self.assertEqual(
+            transformed_row.total,
+            round((transformed_row.exit - transformed_row.entry) / 60, 2)
+        )
+        self.assertEqual(transformed_report.summary.total_hours, transformed_row.total)
+        self.assertEqual(
+            transformed_report.summary.total_payment,
+            calculate_total_payment(transformed_row.total, stale_summary.hourly_rate)
+        )
 
     def test_transformation_preserves_fallback_hours_without_rows(self):
         report = TypeAParser().parse("")
