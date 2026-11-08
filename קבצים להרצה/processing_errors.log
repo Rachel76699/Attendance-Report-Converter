@@ -1,0 +1,8 @@
+a_r_25.pdf: BaseParser.__init__() takes 2 positional arguments but 3 were given
+a_r_9.pdf: BaseParser.__init__() takes 2 positional arguments but 3 were given
+n_r_10_n.pdf: BaseParser.__init__() takes 2 positional arguments but 3 were given
+n_r_5_n.pdf: BaseParser.__init__() takes 2 positional arguments but 3 were given
+n_r_10_n.pdf: No attendance rows found. OCR or parser did not detect expected data.
+n_r_10_n.pdf: No attendance rows found. OCR or parser did not detect expected data.
+a_r_25.pdf: No attendance rows found. OCR or parser did not detect expected data.
+a_r_9.pdf: No attendance rows found. OCR or parser did not detect expected data.
