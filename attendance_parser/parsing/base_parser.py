@@ -1,12 +1,9 @@
 from abc import ABC, abstractmethod
 from datetime import datetime
 
+from domain.exceptions import RowParseError
 from domain.models import AttendanceReport, AttendanceRow, ReportSummary, ReportType
 from transformation.strategies import build_summary
-
-
-class RowParseError(ValueError):
-    """Raised when a report row contains a non-empty value that cannot be parsed."""
 
 
 class BaseParser(ABC):  # מחלקה אבסטרקטיבית בסיסית המגדירה תבנית אחידה (Template Method) לפענוח דוחות נוכחות

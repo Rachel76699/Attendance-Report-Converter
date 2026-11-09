@@ -5,22 +5,36 @@ import os
 import tempfile
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from unittest.mock import patch
+from types import MappingProxyType, SimpleNamespace
+from unittest.mock import Mock, patch
 from openpyxl import load_workbook
 import pymupdf
 import pytest
-from application import process_single_pdf
+from application import parse_arguments, process_single_pdf
+from domain.exceptions import (
+    AttendanceConverterError,
+    RowParseError as DomainRowParseError,
+    TransformationError,
+    UnsupportedReportTypeError,
+)
 from domain.models import AttendanceReport, AttendanceRow, ReportSummary, ReportType
-from parsing import ocr
+from generation import excel_renderer, output_registry, pdf_generator
+from generation.excel_renderer import ExcelRenderer
+from generation.pdf_generator import generate_pdf
+import main as cli
+from parsing import classifier, ocr, parser_factory
 from parsing.base_parser import RowParseError
 from parsing.classifier import classify_report_type
 from parsing.text_tools import normalize_ocr_text, reconstruct_ocr_rows
 from parsing.type_a_parser import TypeAParser
 from parsing.type_b_parser import TypeBParser
-from generation.excel_renderer import ExcelRenderer
-from generation.pdf_generator import generate_pdf
 from transformation.config import TransformationConfig
-from transformation.strategies import TransformationService, calculate_total_payment, is_work_day
+from transformation.strategies import (
+    TransformationService,
+    _validate_transformed_row,
+    calculate_total_payment,
+    is_work_day,
+)
 
 
 @pytest.mark.parametrize(
@@ -69,6 +83,63 @@ class TestAttendanceSystem(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             report.rows = ()
 
+    def test_attendance_report_normalizes_input_to_its_declared_types(self):
+        row = AttendanceRow("02/10/2022", "יום ראשון", 480, 900, 7.0)
+        input_rows = [row]
+        report = AttendanceReport(
+            report_type="TYPE_A",
+            rows=input_rows,
+            summary=ReportSummary(1, 7.0, 30.65, 214.55),
+        )
+
+        input_rows.clear()
+
+        self.assertIs(report.report_type, ReportType.TYPE_A)
+        self.assertEqual(report.rows, (row,))
+        self.assertIsInstance(report.rows, tuple)
+
+    def test_attendance_report_rejects_an_unknown_report_type(self):
+        with self.assertRaises(ValueError):
+            AttendanceReport(
+                report_type="TYPE_C",
+                rows=(),
+                summary=ReportSummary(0, 0.0, 30.65, 0.0),
+            )
+
+    def test_domain_errors_share_the_expected_base_exception(self):
+        for error_type in (
+            DomainRowParseError,
+            UnsupportedReportTypeError,
+            TransformationError,
+        ):
+            with self.subTest(error_type=error_type):
+                self.assertTrue(issubclass(error_type, AttendanceConverterError))
+
+    def test_parser_factory_raises_a_typed_error_for_unknown_report_types(self):
+        from parsing.parser_factory import get_parser
+
+        with self.assertRaises(UnsupportedReportTypeError):
+            get_parser("TYPE_C")
+
+    def test_transformation_rejects_rows_that_violate_each_invariant(self):
+        invalid_rows = (
+            AttendanceRow("02/10/2022", "יום ראשון", 1440, 900, 7.0),
+            AttendanceRow("02/10/2022", "יום ראשון", 900, 480, 7.0),
+            AttendanceRow("02/10/2022", "יום ראשון", 480, 900, -1.0),
+            AttendanceRow(
+                "02/10/2022",
+                "יום ראשון",
+                480,
+                900,
+                7.0,
+                p100=6.0,
+            ),
+        )
+
+        for row in invalid_rows:
+            with self.subTest(row=row), self.assertRaises(TransformationError):
+                _validate_transformed_row(row, TransformationConfig())
+
     def test_classifier_type_a(self):
         """בדיקת זיהוי נכון של דוח סוג A."""
         text = "נ.ע. הנשר כח אדם בע\"מ 125% שבת"
@@ -104,6 +175,19 @@ class TestAttendanceSystem(unittest.TestCase):
         self.assertIsNone(classify_report_type("123"))
         self.assertIsNone(classify_report_type("This is an unrelated document"))
 
+    def test_each_report_type_has_all_required_registered_components(self):
+        report_types = set(ReportType)
+
+        self.assertEqual(set(classifier.CLASSIFIER_SCORERS), report_types)
+        self.assertEqual(set(parser_factory.PARSER_FACTORIES), report_types)
+        self.assertEqual(set(TransformationService().strategies), report_types)
+        self.assertEqual(
+            set(TransformationConfig().summary_policies),
+            report_types,
+        )
+        self.assertEqual(set(excel_renderer.EXCEL_LAYOUTS), report_types)
+        self.assertEqual(set(pdf_generator.PDF_LAYOUTS), report_types)
+
     def test_unrecognized_file_reports_error_without_generating_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             output = StringIO()
@@ -119,6 +203,118 @@ class TestAttendanceSystem(unittest.TestCase):
             self.assertIn("No output was generated", output.getvalue())
             get_parser.assert_not_called()
             self.assertEqual(os.listdir(directory), [])
+
+    def test_process_single_pdf_uses_injected_processing_dependencies(self):
+        report = TypeAParser().parse(self.raw_text_type_a)
+        transformer = Mock()
+        transformer.transform.return_value = report
+        pdf_renderer = Mock(return_value="report.pdf")
+        excel_report_renderer = Mock()
+        excel_report_renderer.render.return_value = "report.xlsx"
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("application.ocr.extract_text_from_pdf", return_value=self.raw_text_type_a),
+                patch("application.classifier.classify_report_type", return_value=ReportType.TYPE_A),
+            ):
+                result = process_single_pdf(
+                    "report.pdf",
+                    directory,
+                    transformation_service=transformer,
+                    pdf_renderer=pdf_renderer,
+                    excel_report_renderer=excel_report_renderer,
+                )
+
+        self.assertTrue(result)
+        transformer.transform.assert_called_once()
+        pdf_renderer.assert_called_once()
+        excel_report_renderer.render.assert_called_once()
+
+    def test_processing_error_is_reported_without_traceback(self):
+        output = StringIO()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "application.ocr.extract_text_from_pdf",
+                side_effect=RuntimeError("OCR backend unavailable"),
+            ),
+            redirect_stdout(output),
+        ):
+            result = process_single_pdf("report.pdf", directory)
+
+        self.assertFalse(result)
+        self.assertIn("report.pdf", output.getvalue())
+        self.assertIn("OCR backend unavailable", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+
+    def test_cli_accepts_force_ocr_and_custom_output_directory(self):
+        with patch(
+            "sys.argv",
+            ["main.py", "reports", "--output", "results", "--force-ocr"],
+        ):
+            args = parse_arguments()
+
+        self.assertEqual(args.input, "reports")
+        self.assertEqual(args.output, "results")
+        self.assertTrue(args.force_ocr)
+
+    def test_main_wires_one_shared_transformation_service(self):
+        args = SimpleNamespace(
+            input="reports",
+            output="results",
+            force_ocr=True,
+        )
+        with (
+            patch.object(cli, "parse_arguments", return_value=args),
+            patch.object(cli, "prepare_paths", return_value=("reports", "results")),
+            patch.object(cli, "collect_pdf_files", return_value=["one.pdf", "two.pdf"]),
+            patch.object(cli, "TransformationService") as service_factory,
+            patch.object(cli, "process_single_pdf", side_effect=[True, True]) as process,
+            patch.object(cli, "print_summary"),
+        ):
+            self.assertEqual(cli.main(), 0)
+        self.assertEqual(service_factory.call_count, 1)
+        self.assertEqual(service_factory.call_count, 1)
+        self.assertEqual(process.call_count, 2)
+        for call in process.call_args_list:
+            self.assertTrue(call.kwargs["force_ocr"])
+            self.assertIs(
+                call.kwargs["transformation_service"],
+                service_factory.return_value,
+            )
+
+    def test_output_format_can_be_registered_in_generation_without_application_changes(self):
+        rendered_paths = []
+
+        class CSVRenderer:
+            def render(self, report, output_path):
+                rendered_paths.append(output_path)
+                Path(output_path).write_text(
+                    report.report_type.value,
+                    encoding="utf-8",
+                )
+                return output_path
+
+        report = TypeAParser().parse(self.raw_text_type_a)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                output_registry,
+                "OUTPUT_RENDERER_FACTORIES",
+                MappingProxyType({".csv": CSVRenderer}),
+            ):
+                paths = output_registry.render_outputs(
+                    report,
+                    directory,
+                    "NEW_report",
+                )
+            self.assertEqual(paths, (os.path.join(directory, "NEW_report.csv"),))
+            self.assertEqual(rendered_paths, list(paths))
+            self.assertTrue(os.path.isfile(paths[0]))
+            self.assertEqual(
+                Path(paths[0]).read_text(encoding="utf-8"),
+                ReportType.TYPE_A.value,
+            )
+
 
     def test_file_with_only_a_generic_keyword_is_rejected_without_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -543,6 +739,19 @@ class TestAttendanceSystem(unittest.TestCase):
             )
         )
 
+    def test_transformation_service_uses_injected_strategy_mapping(self):
+        report = TypeAParser().parse(self.raw_text_type_a)
+        strategy = Mock()
+        strategy.transform.return_value = report
+        service = TransformationService(
+            strategies={ReportType.TYPE_A: strategy}
+        )
+
+        self.assertIs(service.transform(report), report)
+        strategy.transform.assert_called_once_with(
+            report, service.seed, service.config
+        )
+
     def test_transform_is_deterministic_and_does_not_mutate_the_original_report(self):
         row = AttendanceRow(
             date="02/10/2022",
@@ -810,15 +1019,19 @@ class TestAttendanceSystem(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output_paths = []
 
-            def write_pdf(report, path):
+            def write_pdf(report: AttendanceReport, path: str) -> str:
                 output_paths.append(path)
                 if os.path.basename(path) == "NEW_report.pdf":
                     raise PermissionError(13, "Permission denied", path)
                 Path(path).write_bytes(b"pdf")
                 return path
 
+            class TestPDFRenderer:
+                def render(self, report: AttendanceReport, path: str) -> str:
+                    return write_pdf(report, path)
+
             class TestExcelRenderer:
-                def render(self, report, path):
+                def render(self, report: AttendanceReport, path: str) -> str:
                     output_paths.append(path)
                     Path(path).write_bytes(b"xlsx")
                     return path
@@ -826,8 +1039,14 @@ class TestAttendanceSystem(unittest.TestCase):
             with (
                 patch("application.ocr.extract_text_from_pdf", return_value=self.raw_text_type_a),
                 patch("application.classifier.classify_report_type", return_value=ReportType.TYPE_A),
-                patch("application.pdf_generator.generate_pdf", side_effect=write_pdf),
-                patch("application.excel_renderer.ExcelRenderer", TestExcelRenderer),
+                patch.object(
+                    output_registry,
+                    "OUTPUT_RENDERER_FACTORIES",
+                    MappingProxyType({
+                        ".pdf": TestPDFRenderer,
+                        ".xlsx": TestExcelRenderer,
+                    }),
+                ),
             ):
                 self.assertTrue(process_single_pdf("report.pdf", directory))
 

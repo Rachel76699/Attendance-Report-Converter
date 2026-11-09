@@ -1,12 +1,21 @@
 import argparse
 import os
-import traceback
+from collections.abc import Callable
+from typing import Protocol
 
+from domain.exceptions import AttendanceConverterError
 from domain.models import AttendanceReport
-from generation import excel_renderer, pdf_generator
+from generation import output_registry
 from parsing import classifier, ocr, parser_factory
-from parsing.base_parser import RowParseError
 from transformation import strategies
+
+
+class ReportTransformer(Protocol):
+    def transform(self, report: AttendanceReport) -> AttendanceReport: ...
+
+
+class ExcelReportRenderer(Protocol):
+    def render(self, report: AttendanceReport, output_path: str) -> str: ...
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -51,54 +60,37 @@ def collect_pdf_files(source: str) -> list[str]:
     return []
 
 
-def _available_output_paths(output_dir: str, stem: str) -> tuple[str, str]:
-    suffix = 1
-    while True:
-        candidate_stem = f"{stem}_{suffix}"
-        pdf_path = os.path.join(output_dir, f"{candidate_stem}.pdf")
-        excel_path = os.path.join(output_dir, f"{candidate_stem}.xlsx")
-        if not os.path.exists(pdf_path) and not os.path.exists(excel_path):
-            return pdf_path, excel_path
-        suffix += 1
-
-
 def _generate_outputs(
     report: AttendanceReport,
-    pdf_path: str,
-    excel_path: str,
     output_dir: str,
     stem: str,
-) -> tuple[str, str]:
-    try:
-        pdf_generator.generate_pdf(report, pdf_path)
-        excel_renderer.ExcelRenderer().render(report, excel_path)
-        return pdf_path, excel_path
-    except PermissionError as error:
-        blocked_path = getattr(error, "filename", None)
-        output_paths = {
-            os.path.normcase(os.path.abspath(pdf_path)),
-            os.path.normcase(os.path.abspath(excel_path)),
-        }
-        if not blocked_path or os.path.normcase(os.path.abspath(blocked_path)) not in output_paths:
-            raise
-
-        fallback_pdf_path, fallback_excel_path = _available_output_paths(output_dir, stem)
-        print(
-            "    [Warning] An existing output file is unavailable "
-            f"(possibly open in another program). Saving as: "
-            f"{os.path.basename(fallback_pdf_path)} and {os.path.basename(fallback_excel_path)}"
-        )
-        pdf_generator.generate_pdf(report, fallback_pdf_path)
-        excel_renderer.ExcelRenderer().render(report, fallback_excel_path)
-        return fallback_pdf_path, fallback_excel_path
+    pdf_renderer: Callable[[AttendanceReport, str], str] | None = None,
+    excel_report_renderer: ExcelReportRenderer | None = None,
+) -> tuple[str, ...]:
+    overrides = {}
+    if pdf_renderer is not None:
+        overrides[".pdf"] = output_registry.FunctionRenderer(pdf_renderer)
+    if excel_report_renderer is not None:
+        overrides[".xlsx"] = excel_report_renderer
+    return output_registry.render_outputs(
+        report,
+        output_dir,
+        stem,
+        renderer_overrides=overrides,
+    )
 
 
-def process_single_pdf(input_path: str, output_dir: str, force_ocr: bool = False) -> bool:
+def process_single_pdf(
+    input_path: str,
+    output_dir: str,
+    force_ocr: bool = False,
+    transformation_service: ReportTransformer | None = None,
+    pdf_renderer: Callable[[AttendanceReport, str], str] | None = None,
+    excel_report_renderer: ExcelReportRenderer | None = None,
+) -> bool:
     filename = os.path.basename(input_path)
     stem = os.path.splitext(filename)[0]
     output_stem = f"NEW_{stem}"
-    pdf_path = os.path.join(output_dir, f"{output_stem}.pdf")
-    excel_path = os.path.join(output_dir, f"{output_stem}.xlsx")
     print(f"\n[+] Processing: {filename}")
     try:
         raw_text = ocr.extract_text_from_pdf(input_path, force_ocr=force_ocr)
@@ -120,19 +112,22 @@ def process_single_pdf(input_path: str, output_dir: str, force_ocr: bool = False
                 "No output was generated."
             )
             return False
-        report = strategies.TransformationService(seed=42).transform(report)
+        transformer = transformation_service
+        if transformer is None:
+            transformer = strategies.TransformationService(seed=42)
+        report = transformer.transform(report)
         os.makedirs(output_dir, exist_ok=True)
-        saved_pdf_path, saved_excel_path = _generate_outputs(
-            report, pdf_path, excel_path, output_dir, output_stem
+        saved_paths = _generate_outputs(
+            report,
+            output_dir,
+            output_stem,
+            pdf_renderer=pdf_renderer,
+            excel_report_renderer=excel_report_renderer,
         )
-        print(f"    [Success] Saved to: {saved_pdf_path} and {saved_excel_path}")
+        print(f"    [Success] Saved to: {', '.join(saved_paths)}")
         return True
-    except RowParseError as error:
+    except (AttendanceConverterError, OSError, RuntimeError, ValueError) as error:
         print(f"    [Error] Failed to process {filename}: {error}")
-        return False
-    except Exception as error:
-        print(f"    [Error] Failed to process {filename}: {error}")
-        traceback.print_exc()
         return False
 
 

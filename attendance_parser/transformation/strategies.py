@@ -7,6 +7,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from types import MappingProxyType
 from typing import Mapping
 
+from domain.exceptions import TransformationError
 from domain.models import AttendanceReport, AttendanceRow, ReportSummary, ReportType
 from domain.time_utils import is_sabbath_or_holiday, special_day_label
 from transformation.config import (
@@ -62,7 +63,9 @@ def build_summary(
 ) -> ReportSummary:
     policy = config.summary_policies.get(report_type)
     if policy is None:
-        raise ValueError(f"No summary policy configured for report type: {report_type}")
+        raise TransformationError(
+            f"No summary policy configured for report type: {report_type}"
+        )
 
     fallback_days = policy.fallback_days if fallback_days is None else fallback_days
     fallback_hours = policy.fallback_hours if fallback_hours is None else fallback_hours
@@ -120,14 +123,16 @@ def _validate_transformed_row(
 ) -> None:
     for field, value in (("entry", row.entry), ("exit", row.exit)):
         if value is not None and not 0 <= value < config.minutes_per_day:
-            raise ValueError(f"Transformed {field} time is outside a day: {value}")
+            raise TransformationError(
+                f"Transformed {field} time is outside a day: {value}"
+            )
     if row.entry is not None and row.exit is not None and row.exit <= row.entry:
-        raise ValueError(
+        raise TransformationError(
             f"Transformed exit time must be after entry time for {row.date}: "
             f"{row.entry} -> {row.exit}"
         )
     if not 0 <= row.total <= config.maximum_daily_hours:
-        raise ValueError(
+        raise TransformationError(
             f"Transformed total hours are outside the allowed range for "
             f"{row.date}: {row.total}"
         )
@@ -138,7 +143,7 @@ def _validate_transformed_row(
         if round(component_total, config.hours_decimal_places) != round(
             row.total, config.hours_decimal_places
         ):
-            raise ValueError(
+            raise TransformationError(
                 f"Hour breakdown does not add up to total hours for {row.date}: "
                 f"{component_total} != {row.total}"
             )
@@ -240,7 +245,7 @@ class ReportTransformationStrategy:
             if config.allow_zero_shift or offset != 0
         ]
         if not offsets:
-            raise ValueError("No non-zero time shifts are configured")
+            raise TransformationError("No non-zero time shifts are configured")
         if entry is None or exit is None:
             offset = rng.choice(offsets)
             return (
@@ -264,7 +269,7 @@ class ReportTransformationStrategy:
             < config.minutes_per_day
         ]
         if not valid_offsets:
-            raise ValueError(
+            raise TransformationError(
                 f"No valid configured time shifts preserve entry/exit order "
                 f"for {entry} -> {exit}"
             )
@@ -357,14 +362,17 @@ class TransformationService:
         self,
         seed: int = 42,
         config: TransformationConfig = DEFAULT_TRANSFORMATION_CONFIG,
+        strategies: Mapping[ReportType, ReportTransformationStrategy] | None = None,
     ):
         self.seed = seed
         self.config = config
+        resolved_strategies = _STRATEGIES if strategies is None else strategies
+        self.strategies = MappingProxyType(dict(resolved_strategies))
 
     def transform(self, report: AttendanceReport) -> AttendanceReport:
-        strategy = _STRATEGIES.get(report.report_type)
+        strategy = self.strategies.get(report.report_type)
         if strategy is None:
-            raise ValueError(
+            raise TransformationError(
                 f"No transformation strategy configured for report type: "
                 f"{report.report_type}"
             )
