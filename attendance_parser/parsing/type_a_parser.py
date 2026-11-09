@@ -8,7 +8,7 @@ from domain.time_utils import (
     parse_duration_minutes,
     special_day_label,
 )
-from parsing.base_parser import BaseParser
+from parsing.base_parser import BaseParser, RowParseError
 from parsing.text_tools import normalize_ocr_text
 from transformation.strategies import build_summary
 
@@ -42,11 +42,19 @@ class TypeAParser(BaseParser):
         """מפענח שורת נתונים בודדת מטקסט הדוח."""
         parts = [part.strip() for part in line.strip().strip("|").split("|")]
 
-        def parse_number(value: str, fallback: float = 0.0) -> float:
+        def parse_number(value: str, field: str) -> float:
+            if not value:
+                return 0.0
+            if not re.fullmatch(r"\d+(?:[.,]\d+)?", value):
+                raise RowParseError(
+                    f"Invalid {field} value {value!r} in Type A row: {line!r}"
+                )
             try:
                 return float(value.replace(",", "."))
-            except ValueError:
-                return fallback
+            except ValueError as error:
+                raise RowParseError(
+                    f"Invalid {field} value {value!r} in Type A row: {line!r}"
+                ) from error
 
         date_match = _DATE_PATTERN.search(line)
         date_val = date_match.group(1) if date_match else ""
@@ -86,24 +94,30 @@ class TypeAParser(BaseParser):
             _WEEKDAY_NAMES[datetime.strptime(date_val, "%d/%m/%Y").weekday()]
             if date_val else ""
         )
-        total_val = parse_number(total)
-        shabbat_val = parse_number(shabbat)
+        total_val = parse_number(total, "total hours")
+        shabbat_val = parse_number(shabbat, "Shabbat hours")
+        p150_val = parse_number(p150, "150% hours")
+        p125_val = parse_number(p125, "125% hours")
+        p100_val = parse_number(p100, "100% hours")
         if any(marker in reported_day.lower() for marker in _HOLIDAY_MARKERS):
             day_val = reported_day
         special_day = is_sabbath_or_holiday(day_val, date_val)
+        entry_minutes = parse_clock_minutes(entry_val)
+        exit_minutes = parse_clock_minutes(exit_val)
+        break_minutes = parse_duration_minutes(break_val)
 
         return AttendanceRow(
             date=date_val,
             day=special_day_label(day_val, special_day),
-            entry=None if special_day else parse_clock_minutes(entry_val),
-            exit=None if special_day else parse_clock_minutes(exit_val),
+            entry=None if special_day else entry_minutes,
+            exit=None if special_day else exit_minutes,
             total=total_val,
-            break_time=None if special_day else parse_duration_minutes(break_val),
+            break_time=None if special_day else break_minutes,
             location=location_val,
             shabbat=shabbat_val,
-            p150=parse_number(p150),
-            p125=parse_number(p125),
-            p100=parse_number(p100),
+            p150=p150_val,
+            p125=p125_val,
+            p100=p100_val,
             special_day=special_day,
         )
 

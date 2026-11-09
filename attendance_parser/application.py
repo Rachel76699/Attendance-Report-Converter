@@ -5,6 +5,7 @@ import traceback
 from domain.models import AttendanceReport
 from generation import excel_renderer, pdf_generator
 from parsing import classifier, ocr, parser_factory
+from parsing.base_parser import RowParseError
 from transformation import strategies
 
 
@@ -17,6 +18,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "-o", "--output", default="data/output_reports",
         help="Output directory",
+    )
+    parser.add_argument(
+        "--force-ocr", action="store_true",
+        help="Re-extract PDF text instead of using the OCR text cache",
     )
     return parser.parse_args()
 
@@ -88,7 +93,7 @@ def _generate_outputs(
         return fallback_pdf_path, fallback_excel_path
 
 
-def process_single_pdf(input_path: str, output_dir: str) -> bool:
+def process_single_pdf(input_path: str, output_dir: str, force_ocr: bool = False) -> bool:
     filename = os.path.basename(input_path)
     stem = os.path.splitext(filename)[0]
     output_stem = f"NEW_{stem}"
@@ -96,12 +101,25 @@ def process_single_pdf(input_path: str, output_dir: str) -> bool:
     excel_path = os.path.join(output_dir, f"{output_stem}.xlsx")
     print(f"\n[+] Processing: {filename}")
     try:
-        raw_text = ocr.extract_text_from_pdf(input_path)
+        raw_text = ocr.extract_text_from_pdf(input_path, force_ocr=force_ocr)
         if not raw_text or not raw_text.strip():
             print(f"[Error] No text extracted from {filename}")
             return False
         report_type = classifier.classify_report_type(raw_text)
+        if report_type is None:
+            print(
+                f"[Error] {filename} was not recognized as an attendance report "
+                "(supported formats: Type A or Type B). No output was generated."
+            )
+            return False
         report = parser_factory.get_parser(report_type).parse(raw_text)
+        if not report.rows:
+            print(
+                f"[Error] No attendance rows were found in {filename}. "
+                "The file may not be a supported attendance report. "
+                "No output was generated."
+            )
+            return False
         report = strategies.TransformationService(seed=42).transform(report)
         os.makedirs(output_dir, exist_ok=True)
         saved_pdf_path, saved_excel_path = _generate_outputs(
@@ -109,6 +127,9 @@ def process_single_pdf(input_path: str, output_dir: str) -> bool:
         )
         print(f"    [Success] Saved to: {saved_pdf_path} and {saved_excel_path}")
         return True
+    except RowParseError as error:
+        print(f"    [Error] Failed to process {filename}: {error}")
+        return False
     except Exception as error:
         print(f"    [Error] Failed to process {filename}: {error}")
         traceback.print_exc()

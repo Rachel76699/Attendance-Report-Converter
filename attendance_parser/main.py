@@ -24,7 +24,10 @@ def main() -> int:
     if not files:
         print(f"[Info] No PDF files found in {source}")
         return 1
-    results = [process_single_pdf(path, output) for path in files]
+    results = [
+        process_single_pdf(path, output, force_ocr=args.force_ocr)
+        for path in files
+    ]
 
     # 4. Print the result summary.
     print_summary(files, results, output)

@@ -111,9 +111,9 @@ def _extract_text_without_cache(pdf_path: str) -> str:
     return asyncio.run(_extract())
 
 
-def extract_text_from_pdf(pdf_path: str) -> str:
+def extract_text_from_pdf(pdf_path: str, *, force_ocr: bool = False) -> str:
     cache_path = _cache_path_for_pdf(pdf_path)
-    if cache_path.is_file():
+    if not force_ocr and cache_path.is_file():
         return cache_path.read_text(encoding="utf-8")
 
     extracted_text = _extract_text_without_cache(pdf_path)

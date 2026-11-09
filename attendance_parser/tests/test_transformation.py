@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 import os
 import tempfile
 from dataclasses import FrozenInstanceError
@@ -10,12 +12,14 @@ import pytest
 from application import process_single_pdf
 from domain.models import AttendanceReport, AttendanceRow, ReportSummary, ReportType
 from parsing import ocr
+from parsing.base_parser import RowParseError
 from parsing.classifier import classify_report_type
 from parsing.text_tools import normalize_ocr_text, reconstruct_ocr_rows
 from parsing.type_a_parser import TypeAParser
 from parsing.type_b_parser import TypeBParser
 from generation.excel_renderer import ExcelRenderer
 from generation.pdf_generator import generate_pdf
+from transformation.config import TransformationConfig
 from transformation.strategies import TransformationService, calculate_total_payment, is_work_day
 
 
@@ -83,6 +87,53 @@ class TestAttendanceSystem(unittest.TestCase):
             ReportType.TYPE_B
         )
 
+    def test_classifier_recognizes_type_b_when_ocr_corrupts_the_headers(self):
+        raw_text = "\n".join([
+            ":-nwnVbeJ",
+            "21 | u-nn'7 | n-rny | �nt",
+            "3.00 | 11:03 | 8:03 | 2/1/23",
+            "2.88 | 10:57 | 8:04 | 3/1/23",
+            "2.97 | 10:59 | 8:01 | 4/1/23",
+        ])
+
+        self.assertIs(classify_report_type(raw_text), ReportType.TYPE_B)
+        self.assertEqual(len(TypeBParser().parse(raw_text).rows), 3)
+
+    def test_classifier_does_not_guess_when_report_type_is_unknown(self):
+        self.assertIsNone(classify_report_type(""))
+        self.assertIsNone(classify_report_type("123"))
+        self.assertIsNone(classify_report_type("This is an unrelated document"))
+
+    def test_unrecognized_file_reports_error_without_generating_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = StringIO()
+            with (
+                patch("application.ocr.extract_text_from_pdf", return_value="123"),
+                patch("application.parser_factory.get_parser") as get_parser,
+                redirect_stdout(output),
+            ):
+                result = process_single_pdf("123.pdf", directory)
+
+            self.assertFalse(result)
+            self.assertIn("not recognized as an attendance report", output.getvalue())
+            self.assertIn("No output was generated", output.getvalue())
+            get_parser.assert_not_called()
+            self.assertEqual(os.listdir(directory), [])
+
+    def test_file_with_only_a_generic_keyword_is_rejected_without_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = StringIO()
+            with (
+                patch("application.ocr.extract_text_from_pdf", return_value="שבת"),
+                redirect_stdout(output),
+            ):
+                result = process_single_pdf("document.pdf", directory)
+
+            self.assertFalse(result)
+            self.assertIn("No attendance rows were found", output.getvalue())
+            self.assertIn("No output was generated", output.getvalue())
+            self.assertEqual(os.listdir(directory), [])
+
     def test_ocr_cleanup_preserves_valid_november_date_and_words(self):
         self.assertEqual(normalize_ocr_text("01/11/23 OCR"), "01/11/23 OCR")
 
@@ -128,6 +179,32 @@ class TestAttendanceSystem(unittest.TestCase):
                 self.assertEqual(ocr.extract_text_from_pdf(pdf_path), "Fresh OCR text")
                 self.assertEqual(extract.call_count, 2)
 
+    def test_force_ocr_bypasses_cache_and_refreshes_cached_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = os.path.join(directory, "report.pdf")
+            document = pymupdf.open()
+            document.new_page().insert_text((72, 72), "Digital report")
+            document.save(pdf_path)
+            document.close()
+            cache_dir = Path(directory) / "text_cache"
+
+            with (
+                patch.object(ocr, "TEXT_CACHE_DIR", cache_dir),
+                patch.object(ocr, "_ocr_language_signature", return_value="en-US"),
+                patch.object(
+                    ocr,
+                    "_extract_text_without_cache",
+                    side_effect=["Cached text", "Fresh OCR text"],
+                ) as extract,
+            ):
+                self.assertEqual(ocr.extract_text_from_pdf(pdf_path), "Cached text")
+                self.assertEqual(
+                    ocr.extract_text_from_pdf(pdf_path, force_ocr=True),
+                    "Fresh OCR text",
+                )
+                self.assertEqual(ocr.extract_text_from_pdf(pdf_path), "Fresh OCR text")
+                self.assertEqual(extract.call_count, 2)
+
     def test_ocr_table_rows_are_reassembled_by_position(self):
         words = [
             (100, 100, 10, "6.50"),
@@ -166,6 +243,36 @@ class TestAttendanceSystem(unittest.TestCase):
             calculate_total_payment(report.summary.total_hours, report.summary.hourly_rate)
         )
         self.assertEqual(report.summary.total_payment, 199.23)
+
+    def test_type_a_parser_reports_invalid_numeric_values_instead_of_using_zero(self):
+        raw_text = (
+            "not-a-number | 0 | 0 | 6.50 | 6.50 | 00:30 | 15:00 | "
+            "08:00 | office | יום ראשון | 02/10/2022"
+        )
+
+        with self.assertRaisesRegex(RowParseError, "Invalid Shabbat hours"):
+            TypeAParser().parse(raw_text)
+
+    def test_invalid_row_is_reported_without_creating_output_files(self):
+        raw_text = (
+            "not-a-number | 0 | 0 | 6.50 | 6.50 | 00:30 | 15:00 | "
+            "08:00 | office | יום ראשון | 02/10/2022"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = StringIO()
+            with (
+                patch("application.ocr.extract_text_from_pdf", return_value=raw_text),
+                patch(
+                    "application.classifier.classify_report_type",
+                    return_value=ReportType.TYPE_A,
+                ),
+                redirect_stdout(output),
+            ):
+                result = process_single_pdf("report.pdf", directory)
+
+            self.assertFalse(result)
+            self.assertIn("Invalid Shabbat hours", output.getvalue())
+            self.assertEqual(os.listdir(directory), [])
 
     def test_type_a_parser_recovers_missing_date_and_repairs_ocr_fields(self):
         raw_text = "\n".join([
@@ -217,6 +324,7 @@ class TestAttendanceSystem(unittest.TestCase):
         parser = TypeBParser()
         report = parser.parse(self.raw_text_type_b)
 
+        self.assertIsInstance(report, AttendanceReport)
         self.assertIs(report.report_type, ReportType.TYPE_B)
         self.assertGreaterEqual(len(report.rows), 1)
 
@@ -232,6 +340,16 @@ class TestAttendanceSystem(unittest.TestCase):
         self.assertIsNone(row.p100)
         self.assertEqual(report.summary.total_hours, 3.5)
         self.assertEqual(report.summary.total_payment, 107.28)
+
+    def test_type_b_parser_uses_time_column_order_not_earliest_and_latest(self):
+        report = TypeBParser().parse("3.50 | 08:30 | 12:00 | 1/9/22")
+
+        self.assertEqual(report.rows[0].exit, 8 * 60 + 30)
+        self.assertEqual(report.rows[0].entry, 12 * 60)
+
+    def test_type_b_parser_reports_invalid_total_instead_of_using_zero(self):
+        with self.assertRaisesRegex(RowParseError, "Missing or invalid total hours"):
+            TypeBParser().parse("invalid | 12:00 | 8:30 | 1/9/22")
 
     def test_type_b_parser_recovers_ocr_dates_and_weekdays(self):
         raw_text = """
@@ -425,6 +543,107 @@ class TestAttendanceSystem(unittest.TestCase):
             )
         )
 
+    def test_transform_is_deterministic_and_does_not_mutate_the_original_report(self):
+        row = AttendanceRow(
+            date="02/10/2022",
+            day="יום ראשון",
+            entry=8 * 60,
+            exit=15 * 60,
+            total=6.5,
+            break_time=30,
+            p100=6.5,
+            p125=0.0,
+            p150=0.0,
+            shabbat=0.0,
+        )
+        report = AttendanceReport(
+            ReportType.TYPE_A,
+            (row,),
+            ReportSummary(1, 6.5, 30.65, 199.23),
+        )
+        service = TransformationService(seed=321)
+
+        first = service.transform(report)
+        repeated = service.transform(report)
+        independent = TransformationService(seed=321).transform(report)
+
+        self.assertEqual(first, repeated)
+        self.assertEqual(first, independent)
+        self.assertIsNot(first, report)
+        self.assertEqual(report.rows, (row,))
+        self.assertEqual(report.summary.total_hours, 6.5)
+
+    def test_transformed_type_a_breakdown_and_summary_match_recalculated_hours(self):
+        row = AttendanceRow(
+            date="02/10/2022",
+            day="יום ראשון",
+            entry=8 * 60,
+            exit=16 * 60,
+            total=11.0,
+            break_time=30,
+            shabbat=1.0,
+            p150=2.0,
+            p125=1.5,
+            p100=6.5,
+        )
+        report = AttendanceReport(
+            ReportType.TYPE_A,
+            (row,),
+            ReportSummary(1, 11.0, 30.65, 337.15),
+        )
+
+        transformed = TransformationService(seed=42).transform(report)
+        transformed_row = transformed.rows[0]
+        component_hours = sum(
+            value or 0.0
+            for value in (
+                transformed_row.shabbat,
+                transformed_row.p150,
+                transformed_row.p125,
+                transformed_row.p100,
+            )
+        )
+
+        self.assertEqual(round(component_hours, 2), transformed_row.total)
+        self.assertEqual(transformed.summary.total_hours, transformed_row.total)
+        self.assertEqual(
+            transformed.summary.total_payment,
+            calculate_total_payment(
+                transformed.summary.total_hours,
+                transformed.summary.hourly_rate,
+            ),
+        )
+        self.assertEqual(row.total, 11.0)
+        self.assertEqual((row.shabbat, row.p150, row.p125, row.p100), (1.0, 2.0, 1.5, 6.5))
+
+    def test_time_shift_bounds_come_from_transformation_config(self):
+        row = AttendanceRow(
+            date="02/10/2022",
+            day="יום ראשון",
+            entry=8 * 60,
+            exit=15 * 60,
+            total=7.0,
+        )
+        report = AttendanceReport(
+            ReportType.TYPE_B,
+            (row,),
+            ReportSummary(1, 7.0, 30.65, 214.55),
+        )
+        config = TransformationConfig(
+            minimum_shift_minutes=-2,
+            maximum_shift_minutes=3,
+        )
+
+        transformed_row = TransformationService(seed=42, config=config).transform(
+            report
+        ).rows[0]
+
+        self.assertTrue(-2 <= transformed_row.entry - row.entry <= 3)
+        self.assertTrue(-2 <= transformed_row.exit - row.exit <= 3)
+        self.assertNotEqual(transformed_row.entry, row.entry)
+        self.assertNotEqual(transformed_row.exit, row.exit)
+        self.assertGreater(transformed_row.exit, transformed_row.entry)
+
     def test_type_a_parser_preserves_overtime_columns(self):
         raw = "1.00 | 2.00 | 1.50 | 6.50 | 11.00 | 00:30 | 16:00 | 08:00 | משרד | יום ראשון | 02/10/2022"
         row = TypeAParser().parse(raw).rows[0]
@@ -482,6 +701,28 @@ class TestAttendanceSystem(unittest.TestCase):
         self.assertIsNone(transformed.break_time)
         self.assertEqual(transformed.day, "שבת")
         self.assertEqual(transformed.total, row.total)
+
+    def test_sabbath_and_holiday_rows_remain_without_times_after_transformation(self):
+        row = AttendanceRow(
+            date="05/10/22",
+            day="יום כיפור",
+            entry=8 * 60,
+            exit=12 * 60,
+            total=3.5,
+        )
+        report = AttendanceReport(
+            ReportType.TYPE_B,
+            (row,),
+            ReportSummary(1, 3.5, 30.65, 107.28),
+        )
+
+        transformed = TransformationService(seed=42).transform(report)
+        transformed_row = transformed.rows[0]
+
+        self.assertTrue(transformed_row.special_day)
+        self.assertIsNone(transformed_row.entry)
+        self.assertIsNone(transformed_row.exit)
+        self.assertEqual(transformed_row.total, row.total)
 
     def test_saturday_date_is_preserved_when_weekday_is_missing(self):
         row = AttendanceRow(

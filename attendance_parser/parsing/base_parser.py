@@ -5,6 +5,10 @@ from domain.models import AttendanceReport, AttendanceRow, ReportSummary, Report
 from transformation.strategies import build_summary
 
 
+class RowParseError(ValueError):
+    """Raised when a report row contains a non-empty value that cannot be parsed."""
+
+
 class BaseParser(ABC):  # מחלקה אבסטרקטיבית בסיסית המגדירה תבנית אחידה (Template Method) לפענוח דוחות נוכחות
 
     def __init__(self, report_type: ReportType):

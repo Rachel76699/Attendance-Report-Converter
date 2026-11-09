@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 
 from domain.models import AttendanceReport, AttendanceRow, ReportSummary, ReportType
 from domain.time_utils import is_sabbath_or_holiday, parse_clock_minutes, special_day_label
-from parsing.base_parser import BaseParser
+from parsing.base_parser import BaseParser, RowParseError
 from parsing.text_tools import normalize_ocr_text
 from transformation.strategies import build_summary
 
@@ -53,9 +53,13 @@ class TypeBParser(BaseParser):
             ),
             None,
         )
+        if time_values and total_match is None:
+            raise RowParseError(
+                f"Missing or invalid total hours in Type B row: {line!r}"
+            )
         total_val = float(total_match.group().replace(",", ".")) if total_match else 0.0
-        exit_val = time_values[0] if time_values else ""
-        entry_val = time_values[1] if len(time_values) > 1 else ""
+        exit_val = parts[time_indices[0]] if time_indices else ""
+        entry_val = parts[time_indices[1]] if len(time_indices) > 1 else ""
 
         explicit_holiday = next(
             (
@@ -68,6 +72,21 @@ class TypeBParser(BaseParser):
         parsed_date = datetime.strptime(date_value, "%d/%m/%y").date()
         day_val = explicit_holiday or _WEEKDAY_NAMES[parsed_date.weekday()]
         special_day = is_sabbath_or_holiday(day_val, date_value)
+        exit_minutes = parse_clock_minutes(exit_val)
+        entry_minutes = parse_clock_minutes(entry_val)
+        if not special_day:
+            if len(time_values) == 1:
+                raise RowParseError(
+                    f"Expected both entry and exit times in Type B row: {line!r}"
+                )
+            for field, raw_value, parsed_value in (
+                ("exit time", exit_val, exit_minutes),
+                ("entry time", entry_val, entry_minutes),
+            ):
+                if raw_value and parsed_value is None:
+                    raise RowParseError(
+                        f"Invalid {field} value {raw_value!r} in Type B row: {line!r}"
+                    )
         if special_day and not time_values:
             total_val = 0.0
 
@@ -86,8 +105,8 @@ class TypeBParser(BaseParser):
         return AttendanceRow(
             date=date_value,
             day=special_day_label(day_val, special_day),
-            entry=None if special_day else parse_clock_minutes(entry_val),
-            exit=None if special_day else parse_clock_minutes(exit_val),
+            entry=None if special_day else entry_minutes,
+            exit=None if special_day else exit_minutes,
             total=total_val,
             location=notes_val,
             special_day=special_day,
